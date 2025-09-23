@@ -3,13 +3,14 @@ from tkinter import messagebox
 import tkinter.font as tkFont
 import ttkbootstrap as tb
 import mysql.connector
+from mysql.connector import Error
 
 # ---------------- DATABASE CONFIG ----------------
 DB_CONFIG = {
     "host": "localhost",
     "user": "root",         # change to your MySQL username
     "password": "",         # change to your MySQL password
-    "database": "student_db"  # change to your database
+    "database": "mit_db"  # change to your database
 }
 
 PROGRAMS = [
@@ -48,15 +49,23 @@ class App(tb.Window):
         self.admin_user = "admin"
         self.admin_pass = "1234"
 
-        # DB Connection
-        self.conn = mysql.connector.connect(**DB_CONFIG)
-        self.cursor = self.conn.cursor()
-        self._create_table()
+        # DB Connection - handle errors gracefully
+        try:
+            self.conn = mysql.connector.connect(**DB_CONFIG)
+            self.cursor = self.conn.cursor()
+            self._create_table()
+        except Error as e:
+            messagebox.showerror("Database Error", f"Could not connect to database:\n{e}")
+            # create dummy connection/cursor to avoid attribute errors in the UI (read-only mode)
+            self.conn = None
+            self.cursor = None
 
         self.show_login()
 
     # -------- CREATE TABLE --------
     def _create_table(self):
+        if not self.cursor:
+            return
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS students (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -138,7 +147,11 @@ class App(tb.Window):
         self.form["Program"] = tb.Combobox(parent, values=PROGRAMS, state="readonly")
         self.form["Program"].pack(fill="x", pady=2)
 
-        tb.Button(parent, text="Add Student", command=self._add_student, bootstyle="primary").pack(pady=10)
+        btns = tb.Frame(parent)
+        btns.pack(pady=10, fill="x")
+        tb.Button(btns, text="Add Student", command=self._add_student, bootstyle="primary").pack(side="left", padx=5)
+        tb.Button(btns, text="Clear Form", command=self._clear_form, bootstyle="secondary").pack(side="left", padx=5)
+        tb.Button(btns, text="Refresh Table", command=self._load_students, bootstyle="info").pack(side="left", padx=5)
 
     # -------- TABLE + SEARCH --------
     def _build_table(self, parent):
@@ -190,37 +203,62 @@ class App(tb.Window):
 
     # -------- CRUD FUNCTIONS --------
     def _add_student(self):
+        # collect birthday safely (DateEntry may have get_date or get)
+        bday_field = self.form.get("Birthday")
+        if hasattr(bday_field, "get_date"):
+            birthday = bday_field.get_date()
+        else:
+            try:
+                birthday = bday_field.get()
+            except Exception:
+                birthday = None
+
         data = (
             self.form["First Name"].get(),
             self.form["Last Name"].get(),
             self.form["Email"].get(),
             self.form["Phone"].get(),
             self.form["Address"].get(),
-            self.form["Birthday"].entry.get(),
+            birthday,
             self.form["Program"].get(),
             self.form["Intake Year"].get(),
             self.form["LMS Username"].get(),
             self.form["LMS Password"].get()
         )
-        self.cursor.execute("""
-            INSERT INTO students (first_name, last_name, email, phone, address, birthday, program, intake_year, lms_username, lms_password)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, data)
-        self.conn.commit()
-        messagebox.showinfo("Success", "Student added successfully!")
-        self._load_students()
-        self._clear_form()
+
+        if not self.cursor:
+            messagebox.showwarning("Warning", "Database not connected. Cannot add student.")
+            return
+
+        try:
+            self.cursor.execute("""
+                INSERT INTO students (first_name, last_name, email, phone, address, birthday, program, intake_year, lms_username, lms_password)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, data)
+            self.conn.commit()
+            messagebox.showinfo("Success", "Student added successfully!")
+            self._load_students()
+            self._clear_form()
+        except Error as e:
+            messagebox.showerror("Error", f"Could not insert student:\n{e}")
 
     def _view_student(self):
         selected = self.table.selection()
         if not selected:
             messagebox.showwarning("Warning", "Select a student first")
             return
-        item = self.table.item(selected)
+        item = self.table.item(selected[0])
         student_id = item["values"][0]
+
+        if not self.cursor:
+            messagebox.showwarning("Warning", "Database not connected. Cannot load details.")
+            return
 
         self.cursor.execute("SELECT * FROM students WHERE id=%s", (student_id,))
         student = self.cursor.fetchone()
+        if not student:
+            messagebox.showinfo("Info", "Student not found in database")
+            return
         info = "\n".join([f"{desc[0]}: {val}" for desc, val in zip(self.cursor.description, student)])
         messagebox.showinfo("Student Details", info)
 
@@ -229,36 +267,51 @@ class App(tb.Window):
         if not selected:
             messagebox.showwarning("Warning", "Select a student first")
             return
-        item = self.table.item(selected)
+        item = self.table.item(selected[0])
         student_id = item["values"][0]
+
+        if not self.cursor:
+            messagebox.showwarning("Warning", "Database not connected. Cannot edit.")
+            return
 
         self.cursor.execute("SELECT * FROM students WHERE id=%s", (student_id,))
         student = self.cursor.fetchone()
         cols = [d[0] for d in self.cursor.description]
 
+        if not student:
+            messagebox.showinfo("Info", "Student not found in database")
+            return
+
         edit_win = tb.Toplevel(self)
         edit_win.title("Edit Student")
-        edit_win.geometry("400x500")
+        edit_win.geometry("600x600")
 
         entries = {}
+        # build entries while keeping correct mapping of column -> value
         for i, col in enumerate(cols):
             if col == "id":
                 continue
             tb.Label(edit_win, text=col).pack(anchor="w", pady=2)
-            var = tk.StringVar(value=str(student[i]))
+            value = student[i] if i < len(student) else ""
+            var = tk.StringVar(value=str(value))
             ent = tb.Entry(edit_win, textvariable=var)
             ent.pack(fill="x", pady=2)
             entries[col] = var
 
         def save_changes():
-            update_data = [entries[c].get() for c in entries]
-            update_data.append(student_id)
-            sql = f"UPDATE students SET {', '.join([c+'=%s' for c in entries])} WHERE id=%s"
-            self.cursor.execute(sql, tuple(update_data))
-            self.conn.commit()
-            messagebox.showinfo("Success", "Student updated!")
-            self._load_students()
-            edit_win.destroy()
+            keys = list(entries.keys())
+            update_values = [entries[k].get() for k in keys]
+            update_values.append(student_id)
+            set_clause = ", ".join([f"{k}=%s" for k in keys])
+            sql = f"UPDATE students SET {set_clause} WHERE id=%s"
+            try:
+                self.cursor.execute(sql, tuple(update_values))
+                self.conn.commit()
+                messagebox.showinfo("Success", "Student updated!")
+                self._load_students()
+                edit_win.destroy()
+            except Error as e:
+                messagebox.showerror("Error", f"Could not update student:\n{e}")
 
         tb.Button(edit_win, text="Save", command=save_changes, bootstyle="success").pack(pady=10)
 
@@ -267,16 +320,27 @@ class App(tb.Window):
         if not selected:
             messagebox.showwarning("Warning", "Select a student first")
             return
-        item = self.table.item(selected)
+        item = self.table.item(selected[0])
         student_id = item["values"][0]
 
-        self.cursor.execute("DELETE FROM students WHERE id=%s", (student_id,))
-        self.conn.commit()
-        self._load_students()
-        messagebox.showinfo("Deleted", "Student record deleted")
+        if not self.cursor:
+            messagebox.showwarning("Warning", "Database not connected. Cannot delete.")
+            return
+
+        if messagebox.askyesno("Confirm", "Are you sure you want to delete this student?"):
+            try:
+                self.cursor.execute("DELETE FROM students WHERE id=%s", (student_id,))
+                self.conn.commit()
+                self._load_students()
+                messagebox.showinfo("Deleted", "Student record deleted")
+            except Error as e:
+                messagebox.showerror("Error", f"Could not delete student:\n{e}")
 
     # -------- SEARCH & FILTER --------
     def _search_students(self):
+        if not self.cursor:
+            messagebox.showwarning("Warning", "Database not connected. Cannot search.")
+            return
         keyword = "%" + self.search_var.get() + "%"
         self.cursor.execute("""
             SELECT id, first_name, last_name, email, program, intake_year, birthday 
@@ -287,12 +351,15 @@ class App(tb.Window):
         self._populate_table(rows)
 
     def _filter_students(self):
+        if not self.cursor:
+            messagebox.showwarning("Warning", "Database not connected. Cannot filter.")
+            return
         program = self.filter_program.get()
         intake = self.filter_intake.get()
         query = "SELECT id, first_name, last_name, email, program, intake_year, birthday FROM students WHERE 1=1"
         params = []
 
-        if program != "All":
+        if program and program != "All":
             query += " AND program=%s"
             params.append(program)
         if intake:
@@ -304,11 +371,19 @@ class App(tb.Window):
         self._populate_table(rows)
 
     def _load_students(self):
+        # load all rows into table
+        for r in self.table.get_children():
+            self.table.delete(r)
+
+        if not self.cursor:
+            return
+
         self.cursor.execute("SELECT id, first_name, last_name, email, program, intake_year, birthday FROM students")
         rows = self.cursor.fetchall()
         self._populate_table(rows)
 
     def _populate_table(self, rows):
+        # clear then insert
         for r in self.table.get_children():
             self.table.delete(r)
         for row in rows:
@@ -320,11 +395,24 @@ class App(tb.Window):
             w.destroy()
 
     def _clear_form(self):
-        for key in self.form:
-            if isinstance(self.form[key], tk.StringVar):
-                self.form[key].set("")
+        # clear StringVars and widgets inside self.form
+        for key, widget in self.form.items():
+            # StringVar fields
+            if isinstance(widget, tk.StringVar):
+                widget.set("")
             else:
-                self.form[key].set_date("")
+                # try common widget methods for clearing
+                try:
+                    # ttk Combobox and some widgets support .set("")
+                    widget.set("")
+                except Exception:
+                    try:
+                        # DateEntry may support set_date("") or set_date(None)
+                        if hasattr(widget, "set_date"):
+                            widget.set_date("")
+                    except Exception:
+                        pass
+
 
 # -------------------------------------------------
 if __name__ == "__main__":
